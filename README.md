@@ -20,17 +20,16 @@ Original repository by the authors:
 This rewritten version is modularized into the following components:
 
 ### `params`
-- Stores all model parameters (for PDE)
-- Acts as a global configuration module
+- A global configuration module storing all the parameters used by the differential equations
   
 ### `utils`
-- Contains helper functions for:
+- Contains helper functions used for:
   - PDE residual calculation
   - Initial and boundary condition evaluation
 
 ### `variable`
 - A wrapper class built on `SimpleNamespace`
-- Facilitates organized access to:
+- Facilitates organized access to training samples splited as:
   - Initial conditions (IC)
   - Boundary conditions (BC)
   - Collocation points
@@ -38,14 +37,12 @@ This rewritten version is modularized into the following components:
 
 ### `sampler`
 - Handles sampling logic for training:
-  - Domain sampling
-  - Adaptive sampling strategies (if applicable)
 
 ### `residual`
-- Responsible for computing the residuals of:
-  - Allen-Cahn equation
-  - Cahn-Hilliard equation
-- Utilizes automatic differentiation in JAX for accurate gradients
+- Responsible for residual, loss, loss weight computations:
+  - Utilizes automatic differentiation in JAX for accurate gradients 
+  - Computes the residual for initial condition, boundary condition and PDE residuals
+  - Computes also the NTK weights
 
 ### `train`
 - the training file:
