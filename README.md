@@ -47,7 +47,7 @@ This rewritten version is modularized into the following components:
   - Cahn-Hilliard equation
 - Utilizes automatic differentiation in JAX for accurate gradients
 
-### 'train'
+### `train`
 - the training file:
   - contains model definition and training loop
 ---
