@@ -20,29 +20,19 @@ Original repository by the authors:
 This rewritten version is modularized into the following components:
 
 ### `params`
-- A global configuration module storing all the parameters used by the differential equations
+- A global configuration module storing all the parameters
   
-### `utils`
-- Contains helper functions used for:
-  - PDE residual calculation
-  - Initial and boundary condition evaluation
+### `derivative`
+- A set of derivative functions implemented using JAX automatic differentiation
 
-### `variable`
-- A wrapper class built on `SimpleNamespace`
-- Facilitates organized access to training samples splited as:
-  - Initial conditions (IC)
-  - Boundary conditions (BC)
-  - Collocation points
-  - Adaptive sampling points
-
-### `sampler`
-- Handles sampling logic for training:
+### `pde`
+- A PDE module that contains PDE parameters and a set of helper functions in residual computation
 
 ### `residual`
-- Responsible for residual, loss, loss weight computations:
-  - Utilizes automatic differentiation in JAX for accurate gradients 
-  - Computes the residual for initial condition, boundary condition and PDE residuals
-  - Computes also the NTK weights
+- Responsible for residual, loss, loss weight computations, depends on `derivative` and `pde`
+- 
+### `sampler`
+- Handles sampling logic for training, depends on `residual`
 
 ### `train`
 - the training file:
