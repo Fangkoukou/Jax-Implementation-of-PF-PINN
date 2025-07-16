@@ -173,7 +173,7 @@ class PDE:
         phi = y[:, self.nx:]
         return self.x, self.t_eval, c, phi
 
-    def draw_heatmap(self, x, t, C, P):
+    def draw_heatmap(self, x, t, C, P, suptitle = ""):
         """
         Plot heatmaps of phi and c.
 
@@ -203,10 +203,11 @@ class PDE:
         ax[1].set_ylabel('Time (s)')
         fig.colorbar(im1, ax=ax[1], label='c (mole fraction)')
 
+        fig.suptitle(suptitle, fontsize=16)
         plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.show()
 
-    def draw_profiles(self, x, t, C, P, num_profiles=10):
+    def draw_profiles(self, x, t, C, P,  suptitle = "", num_profiles=10):
         """
         Plot profiles at select times.
 
@@ -234,5 +235,6 @@ class PDE:
         ax[1].legend()
         ax[1].grid(True, linestyle=':')
 
+        fig.suptitle(suptitle, fontsize=16)
         plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.show()
