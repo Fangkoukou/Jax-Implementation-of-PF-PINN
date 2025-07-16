@@ -1,277 +1,103 @@
 import jax
 import jax.numpy as jnp
-from jax import vmap, grad, config
+from jax import grad, config
 config.update("jax_enable_x64", True)
+
 
 class Derivative:
     """
-    Computes on-demand partial derivatives of a neural network using JAX.
-
-    This class is designed to compute partial derivatives with respect to 
-    the inputs of a neural network using automatic differentiation. It assumes
-    normalized inputs (x, t) and applies appropriate denormalization factors 
-    when returning derivatives. The model is expected to take exactly two inputs 
-    (x, t) and return exactly two outputs (phi, c).
+    Compute phi, c, and their derivatives from a neural network model.
     """
 
     def __init__(self, x_coef=1.0, t_coef=1.0):
         """
-        Initialize Derivative instance.
-
-        Parameters:
-        -----------
-        x_coef, t_coef : float
-            Scaling coefficients for spatial and temporal inputs.
+        Initialize the normalizing constant for the space and time
         """
-        self.x_coef = jnp.float64(x_coef)
-        self.t_coef = jnp.float64(t_coef)
+        self.x_coef = x_coef
+        self.t_coef = t_coef
 
     def set_coef(self, x_coef, t_coef):
-        """
-        Update scaling coefficients at runtime.
+        """ set the x_coef and t_coef """
+        self.x_coef = x_coef
+        self.t_coef = t_coef
 
-        Parameters:
-        -----------
-        x_coef, t_coef : float
-            New scaling coefficients for spatial and temporal axes.
+    def _vectorize(self, scalar_fn):
         """
-        self.x_coef = jnp.float64(x_coef)
-        self.t_coef = jnp.float64(t_coef)
+        Wrapper function of scalar function that maps (x,t) to a float.
+        Uses jnp.frompyfunc to allow broadcasting.
+
+        Returns:
+            Callable accepting scalar or array-like x, t
+        """
+        ufunc = jnp.frompyfunc(scalar_fn, 2, 1)
+
+        def wrapped(x, t):
+            out = ufunc(x, t)
+            return jnp.asarray(out, dtype=jnp.float64)
+
+        return wrapped
+
+    # ------------------ Scalar functions ------------------
 
     def _phi(self, model, x, t):
-        """
-        Extract the 'phi' component from the model output.
-
-        Parameters:
-        -----------
-        model : callable
-            Model that returns (phi, c) given (x, t).
-        x, t : float
-            Spatial and temporal coordinates.
-
-        Returns:
-        --------
-        float
-            Value of phi at (x, t).
-        """
-        return model(jnp.asarray(x), jnp.asarray(t))[0]
+        return model(x, t)[0]
 
     def _c(self, model, x, t):
-        """
-        Extract the 'c' component from the model output.
+        return model(x, t)[1]
 
-        Parameters:
-        -----------
-        model : callable
-            Model that returns (phi, c) given (x, t).
-        x, t : float
-            Spatial and temporal coordinates.
-
-        Returns:
-        --------
-        float
-            Value of c at (x, t).
-        """
-        return model(jnp.asarray(x), jnp.asarray(t))[1]
-
-    def _dimension_compitable_return(self, fn, x, t):
-        """
-        Apply scalar function `fn` over input arrays via `vmap`.
-
-        Parameters:
-        -----------
-        fn : callable
-            Scalar-valued function of two arguments (x, t).
-        x, t : float or jnp.ndarray
-            Spatial and temporal inputs, scalar or batched.
-
-        Returns:
-        --------
-        jnp.ndarray
-            Output of `fn` applied over inputs with matching shape.
-        """
-        x, t = jnp.asarray(x), jnp.asarray(t)
-        if x.ndim == 0 and t.ndim == 0:
-            return fn(x, t)
-        elif x.ndim == 0:
-            return vmap(lambda ti: fn(x, ti))(t)
-        elif t.ndim == 0:
-            return vmap(lambda xi: fn(xi, t))(x)
-        else:
-            return vmap(fn)(x, t)
+    # ------------------ Evaluation interface ------------------
 
     def phi(self, model, x, t):
-        """
-        Evaluate phi(x, t).
-
-        Parameters:
-        -----------
-        model : callable
-            Neural network returning (phi, c).
-        x, t : float or jnp.ndarray
-            Spatial and temporal coordinates.
-
-        Returns:
-        --------
-        jnp.ndarray
-            phi values at input locations.
-        """
-        fn = lambda xi, ti: self._phi(model, xi, ti)
-        return self._dimension_compitable_return(fn, x, t)
+        """ Evaluate phi(x, t). """
+        fn = lambda x, t: self._phi(model, x, t)
+        return self._vectorize(fn)(x, t)
 
     def c(self, model, x, t):
-        """
-        Evaluate c(x, t).
-
-        Parameters:
-        -----------
-        model : callable
-            Neural network returning (phi, c).
-        x, t : float or jnp.ndarray
-            Spatial and temporal coordinates.
-
-        Returns:
-        --------
-        jnp.ndarray
-            c values at input locations.
-        """
-        fn = lambda xi, ti: self._c(model, xi, ti)
-        return self._dimension_compitable_return(fn, x, t)
+        """ Evaluate c(x, t). """
+        fn = lambda x, t: self._c(model, x, t)
+        return self._vectorize(fn)(x, t)
 
     def phi_t(self, model, x, t):
-        """
-        Compute d/dt(phi)
-
-        Parameters:
-        -----------
-        model : callable
-            Neural network returning (phi, c).
-        x, t : float or jnp.ndarray
-            Spatial and temporal coordinates.
-
-        Returns:
-        --------
-        jnp.ndarray
-            Time derivative of phi, scaled by t_coef.
-        """
-        fn = lambda xi, ti: grad(lambda tii: self._phi(model, xi, tii))(ti) * self.t_coef
-        return self._dimension_compitable_return(fn, x, t)
+        """ Evaluate dphi/dt at (x,t) """
+        fn = lambda x, t: grad(lambda t_: self._phi(model, x, t_))(t) * self.t_coef
+        return self._vectorize(fn)(x, t)
 
     def phi_x(self, model, x, t):
-        """
-        Compute d/dx(phi)
-
-        Parameters:
-        -----------
-        model : callable
-            Neural network returning (phi, c).
-        x, t : float or jnp.ndarray
-            Spatial and temporal coordinates.
-
-        Returns:
-        --------
-        jnp.ndarray
-            Spatial derivative of phi, scaled by x_coef.
-        """
-        fn = lambda xi, ti: grad(lambda xii: self._phi(model, xii, ti))(xi) * self.x_coef
-        return self._dimension_compitable_return(fn, x, t)
+        """ Evaluate dphi/dx at (x,t) """
+        fn = lambda x, t: grad(lambda x_: self._phi(model, x_, t))(x) * self.x_coef
+        return self._vectorize(fn)(x, t)
 
     def phi_2x(self, model, x, t):
-        """
-        Compute d^2/dx^2(phi)
-
-        Parameters:
-        -----------
-        model : callable
-            Neural network returning (phi, c).
-        x, t : float or jnp.ndarray
-            Spatial and temporal coordinates.
-
-        Returns:
-        --------
-        jnp.ndarray
-            Second spatial derivative of phi, scaled by x_coef².
-        """
-        fn = lambda xi, ti: grad(grad(lambda xii: self._phi(model, xii, ti)))(xi) * self.x_coef**2
-        return self._dimension_compitable_return(fn, x, t)
+        """ Evaluate d2phi/dx^2 at (x,t) """
+        fn = lambda x, t: grad(grad(lambda x_: self._phi(model, x_, t)))(x) * self.x_coef**2
+        return self._vectorize(fn)(x, t)
 
     def c_t(self, model, x, t):
-        """
-        Compute d/dt(c)
-
-        Parameters:
-        -----------
-        model : callable
-            Neural network returning (phi, c).
-        x, t : float or jnp.ndarray
-            Spatial and temporal coordinates.
-
-        Returns:
-        --------
-        jnp.ndarray
-            Time derivative of c, scaled by t_coef.
-        """
-        fn = lambda xi, ti: grad(lambda tii: self._c(model, xi, tii))(ti) * self.t_coef
-        return self._dimension_compitable_return(fn, x, t)
+        """ Evaluate dc/dt at (x,t) """
+        fn = lambda x, t: grad(lambda t_: self._c(model, x, t_))(t) * self.t_coef
+        return self._vectorize(fn)(x, t)
 
     def c_x(self, model, x, t):
-        """
-        Compute d/dx(c)
-
-        Parameters:
-        -----------
-        model : callable
-            Neural network returning (phi, c).
-        x, t : float or jnp.ndarray
-            Spatial and temporal coordinates.
-
-        Returns:
-        --------
-        jnp.ndarray
-            Spatial derivative of c, scaled by x_coef.
-        """
-        fn = lambda xi, ti: grad(lambda xii: self._c(model, xii, ti))(xi) * self.x_coef
-        return self._dimension_compitable_return(fn, x, t)
+        """ Evaluate dc/dx at (x,t) """
+        fn = lambda x, t: grad(lambda x_: self._c(model, x_, t))(x) * self.x_coef
+        return self._vectorize(fn)(x, t)
 
     def c_2x(self, model, x, t):
-        """
-        Compute d^2/dx^2(c)
-
-        Parameters:
-        -----------
-        model : callable
-            Neural network returning (phi, c).
-        x, t : float or jnp.ndarray
-            Spatial and temporal coordinates.
-
-        Returns:
-        --------
-        jnp.ndarray
-            Second spatial derivative of c, scaled by x_coef².
-        """
-        fn = lambda xi, ti: grad(grad(lambda xii: self._c(model, xii, ti)))(xi) * self.x_coef**2
-        return self._dimension_compitable_return(fn, x, t)
+        """ Evaluate d2c/dx^2 at (x,t) """
+        fn = lambda x, t: grad(grad(lambda x_: self._c(model, x_, t)))(x) * self.x_coef**2
+        return self._vectorize(fn)(x, t)
 
     def evaluate(self, model, x, t, function_names):
         """
-        Evaluate a list of derivatives on given inputs.
+        Evaluate multiple quantities (phi, phi_x, c_2x, etc) at (x, t).
 
-        Parameters:
-        -----------
-        model : callable
-            Neural network returning (phi, c).
-        x, t : float or jnp.ndarray
-            Spatial and temporal coordinates.
-        function_names : List[str]
-            List of derivative names to evaluate. Valid options include:
-            'phi', 'phi_t', 'phi_x', 'phi_2x',
-            'c', 'c_t', 'c_x', 'c_2x'.
+        Args:
+            model: callable(x, t) -> (phi, c)
+            x, t: scalar or array-like
+            function_names: list of str
 
         Returns:
-        --------
-        dict[str, jnp.ndarray]
-            Dictionary mapping function names to their computed results.
-            Invalid function names return an empty array.
+            dict[str, jnp.ndarray]
         """
         results = {}
         for name in function_names:
