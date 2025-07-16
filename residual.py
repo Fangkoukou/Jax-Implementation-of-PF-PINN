@@ -33,8 +33,8 @@ class Residual:
         derivative : object
             Object to compute required derivatives of model outputs.
         """
-        self.x_coef = jnp.float64(x_coef)
-        self.t_coef = jnp.float64(t_coef)
+        self.x_coef = x_coef
+        self.t_coef = t_coef
         self.pde = pde
         self.deriv = derivative
         self.deriv.set_coef(x_coef, t_coef)
@@ -124,7 +124,7 @@ class Residual:
         res_phi = (
             d["phi_t"]
             - 2 * P["A"] * P["L"] * (c - h * dc - P["c_le"]) * dc * h_p
-            + P["L"] * P["omega_phi"] * g_p
+            - P["L"] * P["omega_phi"] * g_p
             - P["L"] * P["alpha_phi"] * d["phi_2x"]
         )
 
