@@ -1,88 +1,69 @@
 import jax
 import jax.numpy as jnp
 import equinox as eqx
+import matplotlib.pyplot as plt
 
 class PINN(eqx.Module):
     """
-    Physics-Informed Neural Network (PINN) model.
-
-    This class defines a neural network architecture that maps spatial and 
-    temporal coordinates (x, t) to two output quantities (phi, psi), which 
-    typically correspond to physical fields in a PDE system.
+    Physics-Informed Neural Network mapping (x, t) → (phi, psi).
     
     Attributes:
-    -----------
-    net : eqx.nn.MLP
-        Multi-layer perceptron used to approximate the solution (phi, psi).
+        net: eqx.nn.MLP approximating the PDE solution.
     """
-
     net: eqx.nn.MLP
 
     def __init__(self, key=None, width=16, depth=4):
         """
-        Initialize PINN instance.
-
-        Parameters:
-        -----------
-        key : jax.random.PRNGKey or None
-            Random key for network weight initialization. If None, uses a default key.
-        width : int
-            Number of hidden units in each hidden layer.
-        depth : int
-            Number of hidden layers in the MLP architecture.
+        Args:
+            key: PRNGKey for initialization (default: jax.random.PRNGKey(0)).
+            width: Hidden layer width.
+            depth: Number of hidden layers.
         """
         if key is None:
             key = jax.random.PRNGKey(0)
         self.net = eqx.nn.MLP(
-            in_size=2,               # Inputs: x and t
-            out_size=2,              # Outputs: phi and psi
-            width_size=width,       # Hidden layer width
-            depth=depth,            # Number of hidden layers
-            activation=jax.nn.tanh, # Nonlinearity used in each layer
+            in_size=2,
+            out_size=2,
+            width_size=width,
+            depth=depth,
+            activation=jax.nn.tanh,
             key=key
         )
 
-    def _forward_single(self, x, t):
+    def _forward_scalar(self, x, t):
         """
-        Forward pass for a single input coordinate (x, t).
+        Forward pass for a single input.
 
-        Parameters:
-        -----------
-        x : float
-            Spatial coordinate.
-        t : float
-            Temporal coordinate.
+        Args:
+            x, t: Scalars.
 
         Returns:
-        --------
-        out_phi, out_psi : float
-            Predicted values of phi and psi at the input point.
+            phi, c: Scalars.
         """
-        inp = jnp.stack([x, t], axis=-1)   # Shape (2,)
-        out = self.net(inp)                # Shape (2,)
-        out_phi = out[..., 0]
-        out_psi = out[..., 1]
-        return out_phi, out_psi
+        out = self.net(jnp.array([x, t]))
+        return out[0], out[1]
 
     def __call__(self, x, t):
         """
-        Evaluate the network at input (x, t), supporting both scalar and batched inputs.
+        Evaluate model at (x, t).
 
-        Parameters:
-        -----------
-        x : float or array-like
-            Spatial coordinate(s).
-        t : float or array-like
-            Temporal coordinate(s).
+        Args:
+            x, t: Scalars or arrays. Assume x,t are normalized
 
         Returns:
-        --------
-        out_phi, out_psi : float or array
-            Predicted values of phi and psi. If inputs are batched, returns arrays.
+            phi, c: Scalars or arrays matching input shape.
         """
         x, t = jnp.asarray(x), jnp.asarray(t)
         if x.ndim == 0:
-            return self._forward_single(x, t)  # Scalar case
-        else:
-            out_phi, out_psi = jax.vmap(self._forward_single)(x, t)  # Batched case
-            return out_phi, out_psi
+            return self._forward_scalar(x, t)
+        return jax.vmap(self._forward_scalar)(x, t)
+
+    def validation(self, x, t):
+        X, T = jnp.meshgrid(x, t, indexing='xy')
+        X_flat = X.ravel()
+        T_flat = T.ravel()
+    
+        phi, c = self(X_flat, T_flat)
+        P = phi.reshape(T.shape)
+        C = c.reshape(T.shape)
+        return P, C
