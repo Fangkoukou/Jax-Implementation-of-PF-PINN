@@ -19,24 +19,30 @@ Original repository by the authors:
 
 This rewritten version is modularized into the following components:
 
-### `params`
-- A global configuration module storing all the parameters
-  
+### `pde`
+- A PDE module for coupled AC-CH equations, initialized using the set of physical parameters and numerical parameters
+    - The physical parameters includes: alpha_phi, omega_phi, L, M, A, C_{Se}, C_{Le}
+    - The numerical parameters includes: x_range, t_range (in physical units) and nx, nt, the number of discritization
+- Contains a `solve` function that solves the system using `diffrax`
+- Contains two graphing function `draw_heatmap` and `draw_profiles` for solution visulization
+
+### `model`
+- The model module, a simple Multilayer perceptron implemented using Equinox
+    - Maps the normalized coordinates (x,t) to physical (phi, c)
+
 ### `derivative`
 - A set of derivative functions implemented using JAX automatic differentiation
-
-### `pde`
-- A PDE module that contains PDE parameters and a set of helper functions in residual computation
+    - Computes the derivative of model wrt the input x,t
+    - Takes care of normalization, the returned derivatives are in physical units
 
 ### `residual`
 - Responsible for residual, loss, loss weight computations, depends on `derivative` and `pde`
-- 
+  
 ### `sampler`
 - Handles sampling logic for training, depends on `residual`
 
 ### `train`
-- the training file:
-  - contains model definition and training loop
+- the training file, contains the training loop
 ---
 
 ## Features
