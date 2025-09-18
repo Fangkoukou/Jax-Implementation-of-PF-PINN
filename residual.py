@@ -1,306 +1,244 @@
 import jax
 import jax.numpy as jnp
 import equinox as eqx
-from jax import vmap, grad, config, debug
+from jax import vmap, grad, config, lax
 from jax.flatten_util import ravel_pytree
-config.update("jax_enable_x64", True)
+from jax.tree_util import tree_map, tree_leaves
+
+# Note: enabling 64-bit precision can improve accuracy for PDE solvers
+# but may reduce performance depending on hardware.
+# config.update("jax_enable_x64", True)
 
 class Residual:
     """
-    Encapsulates computation of PDE residuals and related losses
-    for physics-informed neural networks (PINNs) on a 2-component model.
-
-    The residuals correspond to:
-      - Initial conditions (IC)
-      - Boundary conditions (BC)
-      - Physics PDE residuals (split into two components: 'ac' and 'ch')
-
-    Also supports:
-      - Adaptive sampling based on residual or gradient magnitude
-      - NTK-based weight computation for loss balancing
+    Computes residuals for PINNs applied to Allen–Cahn (AC) and Cahn–Hilliard (CH).
+    Includes:
+      - Initial condition residual
+      - Boundary condition residual
+      - PDE residual (AC + CH)
+      - Data residual
+    Also provides NTK-based weighting for balancing losses.
     """
-    
-    def __init__(self, x_coef, t_coef, pde, derivative):
+
+    def __init__(self, span_pde, span_model, pdekernel, derivative):
+        # Store spans for mapping between PDE space and normalized model space
+        self.span_pde = span_pde       # Physical spans (dimensionless PDE space)
+        self.span_model = span_model   # Model input spans (normalized space)
+        self.pdekernel = pdekernel     # PDE kernel with physics functions (e.g. h, g, P_AC1...)
+        self.deriv = derivative        # Derivative evaluator (computes temporal/spatial derivatives)
+
+    # --------------------- utility functions --------------------- #
+    @staticmethod
+    def _map_span(u, src, tgt):
+        """Map a value u from a source interval [a,b] to a target interval [c,d]."""
+        a, b = src
+        c, d = tgt
+        return (u - a) / (b - a) * (d - c) + c
+
+    def denorm(self, D, keys_to_denorm=None):
         """
-        Initialize Residual instance.
+        Map inputs from normalized model space back to PDE space.
 
-        Parameters:
-        -----------
-        x_coef, t_coef : float
-            Normalizing coefficients for spatial and temporal inputs.
-        pde : object
-            PDE object providing IC, BC, and PDE terms (phi_ic, c_ic, phi_bc, c_bc, h, h_p, etc.)
-        derivative : object
-            Object to compute required derivatives of model outputs.
-        """
-        self.x_coef = x_coef
-        self.t_coef = t_coef
-        self.pde = pde
-        self.deriv = derivative
-        self.deriv.set_coef(x_coef, t_coef)
-
-    def res_ic(self, model, x, t):
-        """
-        Compute initial condition residuals.
-
-        Parameters:
-        -----------
-        model : callable
-            PINN model predicting (phi, c) given (x, t).
-        x, t : arrays
-
+        Args:
+            D (dict): dictionary of normalized values.
+            keys_to_denorm (list, optional): subset of keys to denormalize.
         Returns:
-        --------
-        dict with key 'ic' containing residual vector for initial condition enforcement.
-
-        Notes:
-        --------
-        Input x,t are assumed to have been normalized using self.x_coef, self.t_coef
+            dict: dictionary with selected values denormalized.
         """
-        phi_pred, c_pred = model(x, t)
-        phi_ic = self.pde.phi_ic(x / self.x_coef, t / self.t_coef)
-        c_ic   = self.pde.c_ic(x / self.x_coef, t / self.t_coef)
-        # Residuals: predicted - true initial condition values
-        return {'ic': jnp.concatenate([phi_pred - phi_ic, c_pred - c_ic]).ravel()}
+        out_dict = D.copy()
+        keys_to_process = keys_to_denorm if keys_to_denorm is not None else D.keys()
 
-    def res_bc(self, model, x, t):
+        for key in keys_to_process:
+            if key in self.span_pde and key in self.span_model and key in D:
+                normalized_value = D[key]
+                out_dict[key] = self._map_span(normalized_value,
+                                               self.span_model[key],
+                                               self.span_pde[key])
+        return out_dict
+
+    # --------------------- residual functions --------------------- #
+    def res_ic(self, model, inp_model):
+        """Residual for initial conditions (IC)."""
+        # Model predictions
+        pred = model.predict(inp_model)
+        phi_pred, c_pred = pred['phi'], pred['c']
+
+        # Ground truth ICs in PDE space
+        inp_pde = self.denorm(inp_model)
+        phi = self.pdekernel.phi_ic_nd(inp_pde['x'], inp_pde['t'], **inp_pde)
+        c = self.pdekernel.c_ic_nd(inp_pde['x'], inp_pde['t'], **inp_pde)
+
+        # Residual = prediction - ground truth
+        res = jnp.stack([phi_pred - phi, c_pred - c], axis=0).ravel()
+        return {'ic': res}
+
+    def res_bc(self, model, inp_model):
+        """Residual for boundary conditions (BC)."""
+        pred = model.predict(inp_model)
+        phi_pred, c_pred = pred['phi'], pred['c']
+
+        inp_pde = self.denorm(inp_model)
+        phi = self.pdekernel.phi_bc_nd(inp_pde['x'], inp_pde['t'])
+        c = self.pdekernel.c_bc_nd(inp_pde['x'], inp_pde['t'])
+
+        res = jnp.stack([phi_pred - phi, c_pred - c], axis=0).ravel()
+        return {'bc': res}
+
+    def res_pde(self, model, inp_model):
         """
-        Compute boundary condition residuals.
-
-        Parameters:
-        -----------
-        model : callable
-            PINN model predicting (phi, c) given (x, t).
-        x, t : arrays
-
-        Returns:
-        --------
-        dict with key 'bc' containing residual vector for initial condition enforcement.
-        
-        Notes:
-        --------
-        Input x,t are assumed to have been normalized using self.x_coef, self.t_coef
+        Residual for PDEs:
+          - Allen–Cahn (AC)
+          - Cahn–Hilliard (CH)
         """
-        phi_pred, c_pred = model(x, t)
-        phi_bc = self.pde.phi_bc(x * self.x_coef, t * self.t_coef)
-        c_bc   = self.pde.c_bc(x * self.x_coef, t * self.t_coef)
-        return {'bc': jnp.concatenate([phi_pred - phi_bc, c_pred - c_bc]).ravel()}
+        # Model predictions
+        pred = model.predict(inp_model)
+        phi_pred, c_pred = pred['phi'], pred['c']
 
-    def res_phys(self, model, x, t):
-        """
-        Compute PDE residuals enforcing physics at collocation points.
+        # Get derivatives (e.g. phi_t, phi_x, phi_xx, c_t, c_xx)
+        sorted_inp_names = sorted(self.deriv.inp_idx.keys(), key=self.deriv.inp_idx.get)
+        ordered_args = [inp_model[name] for name in sorted_inp_names]
+        derivs = self.deriv.evaluate(
+            model, *ordered_args,
+            function_names=['phi_t', 'phi_x', 'phi_2x', 'c_t', 'c_2x']
+        )
 
-        Residuals correspond to two equations (denoted 'ac' and 'ch') arising from the PDE system.
+        # Nonlinear terms from PDE kernel
+        h = self.pdekernel.h(phi_pred)
+        h_p = self.pdekernel.h_p(phi_pred)
+        h_xx = self.pdekernel.h_pp(phi_pred) * derivs['phi_x']**2 + h_p * derivs['phi_2x']
+        g_p = self.pdekernel.g_p(phi_pred)
 
-        Parameters:
-        -----------
-        model : callable
-        x, t : jnp.arrays
-        
-        Returns:
-        --------
-        dict with keys 'ac' and 'ch' containing physics residual vectors.
-        
-        Notes:
-        --------
-        Input x,t are assumed to have been normalized using self.x_coef, self.t_coef
-        """
-        phi, c = model(x, t)
+        inp_pde = self.denorm(inp_model)
 
-        # Evaluate required derivatives
-        d = self.deriv.evaluate(model, x, t, ["phi_t", "phi_x", "phi_2x", "c_t", "c_x", "c_2x"])
-
-        # Extract PDE parameters for compactness
-        P = {k: getattr(self.pde, k) for k in ["A", "L", "c_se", "c_le", "omega_phi", "alpha_phi", "M"]}
-        dc = P["c_se"] - P["c_le"]
-
-        # Nonlinear functions and their derivatives of phi
-        h   = self.pde.h(phi)
-        h_p = self.pde.h_p(phi)
-        h_xx = self.pde.h_pp(phi) * d["phi_x"]**2 + h_p * d["phi_2x"]
-        g_p = self.pde.g_p(phi)
-
-        # Residual for 'phi' equation (ac)
+        # Allen–Cahn residual
         res_phi = (
-            d["phi_t"]
-            - 2 * P["A"] * P["L"] * (c - h * dc - P["c_le"]) * dc * h_p
-            - P["L"] * P["omega_phi"] * g_p
-            - P["L"] * P["alpha_phi"] * d["phi_2x"]
+            derivs['phi_t']
+            - self.pdekernel.P_AC1(**inp_pde) * (c_pred - h) * h_p
+            - self.pdekernel.P_AC2(**inp_pde) * g_p
+            - self.pdekernel.P_AC3(**inp_pde) * derivs['phi_2x']
         )
 
-        # Residual for 'c' equation (ch)
-        res_c = (
-            d["c_t"]
-            - 2 * P["A"] * P["M"] * d["c_2x"]
-            + 2 * P["A"] * P["M"] * dc * h_xx
-        )
+        # Cahn–Hilliard residual
+        res_c = derivs['c_t'] - (derivs['c_2x'] - h_xx) * self.pdekernel.P_CH(**inp_pde)
 
-        return {
-            'ac': res_phi.ravel(),
-            'ch': res_c.ravel()
-        }
+        return {'ac': res_phi.ravel(), 'ch': res_c.ravel()}
 
-    def compute_loss(self, model, x, t):
+    def res_data(self, model, inp_model):
+        """Residual for supervised data (φ, c values)."""
+        if not inp_model:   # Handle empty input dict
+            return {'data': jnp.array(0.0)}
+
+        pred = model.predict(inp_model)
+        phi_pred, c_pred = pred['phi'], pred['c']
+
+        res = jnp.stack([phi_pred - inp_model['phi'],
+                         c_pred - inp_model['c']], axis=0).ravel()
+        return {'data': res}
+
+    # --------------------- loss computation --------------------- #
+    def compute_loss(self, model, combined_inp):
         """
-        Compute MSE losses for each residual type over sampled points.
-
-        Parameters:
-        -----------
-        model : callable
-        x, t : dict of jnp.array keyed by ['ic', 'bc', 'colloc', 'adapt']
-
-        Returns:
-        --------
-        dict with MSE losses: {'ic', 'bc', 'ac', 'ch'}
-
-        Notes:
-        --------
-        Input x,t are assumed to have been normalized using self.x_coef, self.t_coef
+        Compute mean squared error (MSE) loss for all residual components.
+        Combines IC, BC, PDE, and data residuals.
         """
-        # Initial and boundary condition residual losses
-        res_ic = self.res_ic(model, x['ic'], t['ic'])['ic']
-        res_bc = self.res_bc(model, x['bc'], t['bc'])['bc']
-        loss_ic = jnp.mean(res_ic**2)
-        loss_bc = jnp.mean(res_bc**2)
+        residuals = {}
+        residuals.update(self.res_ic(model, combined_inp['ic']))
+        residuals.update(self.res_bc(model, combined_inp['bc']))
+        residuals.update(self.res_pde(model, combined_inp['colloc']))
+        residuals.update(self.res_data(model, combined_inp['data']))
+        return {k: jnp.mean(v**2) for k, v in residuals.items()}
 
-        # Physics residual loss (concatenate collocation and adaptive points)
-        x_phys = jnp.concatenate([x['colloc'], x['adapt']])
-        t_phys = jnp.concatenate([t['colloc'], t['adapt']])
-        phys = self.res_phys(model, x_phys, t_phys)
-        loss_ac = jnp.mean(phys['ac']**2)
-        loss_ch = jnp.mean(phys['ch']**2)
-
-        return {
-            'ic': loss_ic,
-            'bc': loss_bc,
-            'ac': loss_ac,
-            'ch': loss_ch
-        }
-
-    def get_noisy_points(self, model, x, t, k, which_criterion="residual"):
-        """
-        Adaptive sampling: select points with largest residual or gradient magnitude.
-
-        Parameters:
-        -----------
-        model : callable
-        x, t : arrays of candidate points (noramlized)
-        k : int
-            Number of points to select
-        which_criterion : str
-            'residual' or 'gradient'
-
-        Returns:
-        --------
-        x_top, t_top : arrays of selected points
-
-        Notes:
-        --------
-        Input x,t are assumed to have been normalized using self.x_coef, self.t_coef
-        """
-        topk = lambda arr, num: jnp.argsort(-arr)[:num]
-
-        k1 = k // 2
-        k2 = k - k1
-
-        if which_criterion == "residual":
-            res = self.res_phys(model, x, t)
-            idx1 = topk(jnp.abs(res['ac']), k1)
-            idx2 = topk(jnp.abs(res['ch']), k2)
-
-        elif which_criterion == "gradient":
-            grads = self.deriv.evaluate(model, x, t, ["phi_t", "phi_x", "c_t", "c_x"])
-            mag_dt = jnp.sqrt(grads["phi_t"]**2 + grads["c_t"]**2)
-            mag_dx = jnp.sqrt(grads["phi_x"]**2 + grads["c_x"]**2)
-            idx1 = topk(mag_dt, k1)
-            idx2 = topk(mag_dx, k2)
-
-        else:
-            raise ValueError(f"Invalid criterion '{which_criterion}', must be 'residual' or 'gradient'.")
-
-        x_top = jnp.concatenate([x[idx1], x[idx2]])
-        t_top = jnp.concatenate([t[idx1], t[idx2]])
-        return x_top, t_top
-
+    # --------------------- NTK utilities --------------------- #
     def ntk_residual_wrappers(self):
         """
-        Prepare wrapped residual functions for NTK weight computation.
-
-        Returns:
-        --------
-        dict of functions keyed by residual type.
-        Each function accepts (flat_params, recon, static, x, t)
+        Build wrappers for each residual to compute NTK (Jacobian trace).
+        Each wrapper takes flattened parameters, reconstructs the model, and
+        outputs the residual vector for a specific component.
         """
         def wrap(fn, key):
-            def wrapped(fp, recon, static, x_, t_):
-                model = eqx.combine(recon(fp), static)
-                return fn(model, x_, t_)[key]
+            def wrapped(flat_p, recon, static, inp):
+                model = eqx.combine(recon(flat_p), static)
+                return fn(model, inp)[key]
             return wrapped
 
-        return {k: wrap(getattr(self, f"res_{k}") if k in ['ic','bc'] else self.res_phys, k)
-                for k in ['ic', 'bc', 'ac', 'ch']}
-
-    def compute_ntk_weights(self, model, x, t, batch_size=32):
-        """
-        Compute Neural Tangent Kernel (NTK) trace weights for residual terms.
-
-        These weights can be used to balance losses dynamically based on gradient magnitudes.
-
-        Parameters:
-        -----------
-        model : Equinox model
-        x, t : dict of jnp.array keyed by ['ic', 'bc', 'colloc', 'adapt']
-        batch_size : int
-
-        Returns:
-        --------
-        dict of NTK weights keyed by residual type.
-
-        Notes:
-        --------
-        Input x,t are assumed to have been normalized using self.x_coef, self.t_coef
-        """
-        eps = 1e-8
-        # Separate trainable parameters from static parts
-        params, static = eqx.partition(model, eqx.is_inexact_array)
-        flat_p, recon = ravel_pytree(params)
-        fns = self.ntk_residual_wrappers()
-
-        # Prepare input splits per residual type
-        x_phys = jnp.concatenate([x['colloc'], x['adapt']])
-        t_phys = jnp.concatenate([t['colloc'], t['adapt']])
-        splits = {
-            'ic': (x['ic'],      t['ic']),
-            'bc': (x['bc'],      t['bc']),
-            'ac': (x_phys,       t_phys),
-            'ch': (x_phys,       t_phys),
+        return {
+            'ic': wrap(self.res_ic, 'ic'),
+            'bc': wrap(self.res_bc, 'bc'),
+            'ac': wrap(self.res_pde, 'ac'),
+            'ch': wrap(self.res_pde, 'ch'),
+            'data': wrap(self.res_data, 'data'),
         }
 
-        def trace_sq(J): 
-            return jnp.sum(J**2)
+    def compute_ntk_weights(self, model, inp, batch_size=64):
+        """
+        Compute NTK-based weights for each residual term.
 
-        def batched_trace(fn, x_, t_):
-            n = x_.shape[0]
-            total = 0.0
-            # Batch over input points to compute squared Jacobian norm traces
-            for i in range(0, n, batch_size):
-                xb, tb = x_[i:i+batch_size], t_[i:i+batch_size]
-                def local(p, xi, ti): 
-                    return fn(p, recon, static, xi[None], ti[None])
-                def single(xi, ti): 
-                    # Jacobian w.r.t. parameters for a single point
-                    return trace_sq(jax.jacfwd(lambda p: local(p, xi, ti))(flat_p))
-                total += jnp.sum(vmap(single)(xb, tb))
-            return total, n
+        NTK weight for component k:
+            w_k ∝ n_k / Tr(J_k J_k^T)
+        where:
+            n_k = number of samples
+            J_k = Jacobian of residual wrt parameters
 
-        results = {k: batched_trace(fns[k], *splits[k]) for k in splits}
-        traces = {k: v[0] for k, v in results.items()}
-        Ns     = {k: v[1] for k, v in results.items()}
+        Args:
+            model: the PINN model
+            inp: dict of training inputs (ic, bc, colloc, data)
+            batch_size: minibatch size for large datasets
+        """
+        eps = 1e-8
+        params, static = eqx.partition(model, eqx.is_inexact_array)
+        flat_p, recon = ravel_pytree(params)
+        res_fns = self.ntk_residual_wrappers()
+        inps = {
+            'ic': inp['ic'],
+            'bc': inp['bc'],
+            'ac': inp['colloc'],
+            'ch': inp['colloc'],
+            'data': inp['data'],
+        }
 
-        # Inverse trace weighting normalized by sample size
-        inv    = {k: (traces[k]+eps)/Ns[k] for k in splits}
-        unnorm = {k: Ns[k]/(traces[k]+eps) for k in splits}
-        total_inv = sum(inv.values())
+        def batched_trace(fn, _inp):
+            """
+            Compute NTK trace for one residual component.
+            Uses batching to avoid memory blowup.
+            """
+            leaves = tree_leaves(_inp)
+            if not leaves: return 0.0, 0
+            n = leaves[0].shape[0]
+            if n == 0: return 0.0, 0
 
-        # Return weights scaled to keep total sum balanced
-        return {k: unnorm[k]*total_inv for k in splits}
+            def single_point_trace(__inp_slice):
+                local = lambda p: fn(p, recon, static, __inp_slice)
+                return jnp.sum(jax.jacrev(local)(flat_p) ** 2)
+
+            batch_trace_fn = vmap(single_point_trace)
+
+            if n <= batch_size:
+                total = jnp.sum(batch_trace_fn(_inp))
+                return total, n
+            else:
+                # Split into batches
+                num_full_batches = n // batch_size
+                n_processed = num_full_batches * batch_size
+                truncated_inp = tree_map(lambda x: x[:n_processed], _inp)
+                batched_inp = tree_map(
+                    lambda x: x.reshape(num_full_batches, batch_size, *x.shape[1:]),
+                    truncated_inp
+                )
+
+                def scan_body(accumulated_total, one_batch):
+                    batch_total = jnp.sum(batch_trace_fn(one_batch))
+                    return accumulated_total + batch_total, None
+
+                final_total, _ = lax.scan(scan_body, 0.0, batched_inp)
+                return final_total, n_processed
+
+        # Compute raw NTK weights
+        raw_weight = {}
+        scale = 0
+        for k, _inp in inps.items():
+            total, n = batched_trace(res_fns[k], _inp)
+            raw_weight[k] = n / (total + eps)
+            scale += total / (n + eps)
+
+        # Normalize weights by scale factor
+        return {k: u * scale for k, u in raw_weight.items()}

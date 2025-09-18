@@ -1,109 +1,126 @@
 import jax
 import jax.numpy as jnp
-from jax import grad, config
-config.update("jax_enable_x64", True)
-
+import re
+from jax import grad, vmap
+from collections import defaultdict
 
 class Derivative:
     """
-    Compute phi, c, and their derivatives from a neural network model.
+    Generic derivative generator for JAX-based models.
+
+    Attributes:
+        inp_idx: Maps input names to argument indices.
+        out_idx: Maps output names to output indices.
+        phys_span: Physical variable ranges.
+        norm_span: Normalized variable ranges.
+        norm_coefs: Scaling factors for normalized derivatives.
     """
 
-    def __init__(self, x_coef=1.0, t_coef=1.0):
+    def __init__(self, inp_idx, out_idx, phys_span, norm_span):
         """
-        Initialize the normalizing constant for the space and time
-        """
-        self.x_coef = x_coef
-        self.t_coef = t_coef
-
-    def set_coef(self, x_coef, t_coef):
-        """ set the x_coef and t_coef """
-        self.x_coef = x_coef
-        self.t_coef = t_coef
-
-    def _vectorize(self, scalar_fn):
-        """
-        Wrapper function of scalar function that maps (x,t) to a float.
-        Uses jnp.frompyfunc to allow broadcasting.
-
-        Returns:
-            Callable accepting scalar or array-like x, t
-        """
-        ufunc = jnp.frompyfunc(scalar_fn, 2, 1)
-
-        def wrapped(x, t):
-            out = ufunc(x, t)
-            return jnp.asarray(out, dtype=jnp.float64)
-
-        return wrapped
-
-    # ------------------ Scalar functions ------------------
-
-    def _phi(self, model, x, t):
-        return model(x, t)[0]
-
-    def _c(self, model, x, t):
-        return model(x, t)[1]
-
-    # ------------------ Evaluation interface ------------------
-
-    def phi(self, model, x, t):
-        """ Evaluate phi(x, t). """
-        fn = lambda x, t: self._phi(model, x, t)
-        return self._vectorize(fn)(x, t)
-
-    def c(self, model, x, t):
-        """ Evaluate c(x, t). """
-        fn = lambda x, t: self._c(model, x, t)
-        return self._vectorize(fn)(x, t)
-
-    def phi_t(self, model, x, t):
-        """ Evaluate dphi/dt at (x,t) """
-        fn = lambda x, t: grad(lambda t_: self._phi(model, x, t_))(t) * self.t_coef
-        return self._vectorize(fn)(x, t)
-
-    def phi_x(self, model, x, t):
-        """ Evaluate dphi/dx at (x,t) """
-        fn = lambda x, t: grad(lambda x_: self._phi(model, x_, t))(x) * self.x_coef
-        return self._vectorize(fn)(x, t)
-
-    def phi_2x(self, model, x, t):
-        """ Evaluate d2phi/dx^2 at (x,t) """
-        fn = lambda x, t: grad(grad(lambda x_: self._phi(model, x_, t)))(x) * self.x_coef**2
-        return self._vectorize(fn)(x, t)
-
-    def c_t(self, model, x, t):
-        """ Evaluate dc/dt at (x,t) """
-        fn = lambda x, t: grad(lambda t_: self._c(model, x, t_))(t) * self.t_coef
-        return self._vectorize(fn)(x, t)
-
-    def c_x(self, model, x, t):
-        """ Evaluate dc/dx at (x,t) """
-        fn = lambda x, t: grad(lambda x_: self._c(model, x_, t))(x) * self.x_coef
-        return self._vectorize(fn)(x, t)
-
-    def c_2x(self, model, x, t):
-        """ Evaluate d2c/dx^2 at (x,t) """
-        fn = lambda x, t: grad(grad(lambda x_: self._c(model, x_, t)))(x) * self.x_coef**2
-        return self._vectorize(fn)(x, t)
-
-    def evaluate(self, model, x, t, function_names):
-        """
-        Evaluate multiple quantities (phi, phi_x, c_2x, etc) at (x, t).
+        Initialize Derivative instance.
 
         Args:
-            model: callable(x, t) -> (phi, c)
-            x, t: scalar or array-like
-            function_names: list of str
+            inp_idx: Mapping of input variable names to indices.
+            out_idx: Mapping of output variable names to indices.
+            phys_span: Physical variable ranges (min,max) for scaling.
+            norm_span: Normalized variable ranges (min,max) for scaling.
+        """
+        self.inp_idx = inp_idx
+        self.out_idx = out_idx
+        self.phys_span = phys_span
+        self.norm_span = norm_span
+        self.norm_coefs = {name: self._get_coef(norm_span[name], phys_span[name])
+                           for name in inp_idx}
+
+    def _get_coef(self, norm_range, phys_range):
+        """
+        Compute scaling factor from normalized to physical units.
+
+        Args:
+            norm_range: (min,max) in normalized space.
+            phys_range: (min,max) in physical space.
 
         Returns:
-            dict[str, jnp.ndarray]
+            float: scaling factor.
+        """
+        if phys_range[1] == phys_range[0]:
+            return 1.0
+        return (norm_range[1] - norm_range[0]) / (phys_range[1] - phys_range[0])
+
+    def _parse_name(self, name_str):
+        """
+        Parse derivative identifier string.
+
+        Args:
+            name_str: e.g., 'phi_x2_t'.
+
+        Returns:
+            output name, derivative orders per variable as dict.
+        """
+        parts = name_str.split('_')
+        out_name = parts[0]
+        deriv_order = defaultdict(int)
+        pattern = re.compile(r"([a-zA-Z]+)(\d*)|(\d+)([a-zA-Z]+)")
+
+        for token in parts[1:]:
+            match = pattern.fullmatch(token)
+            if not match:
+                raise ValueError(f"Invalid derivative token '{token}' in '{name_str}'")
+            var = match.group(1) or match.group(4)
+            pow_str = match.group(2) or match.group(3)
+            order = int(pow_str) if pow_str else 1
+            deriv_order[var] += order
+
+        return out_name, dict(deriv_order)
+
+    def create_deriv_fn(self, name_str):
+        """
+        Dynamically create a derivative function and attach it.
+
+        Args:
+            name_str: derivative identifier, e.g., 'phi_x2_t'.
+        """
+        out_name, deriv_order = self._parse_name(name_str)
+
+        def base_fn(model, *args):
+            """Scalar output function for one sample."""
+            out = model(*args)
+            return out[self.out_idx[out_name]]
+
+        grad_fn = base_fn
+        for var, order in deriv_order.items():
+            argnum = self.inp_idx[var] + 1  # skip model arg
+            for _ in range(order):
+                grad_fn = grad(grad_fn, argnums=argnum)
+
+        scale = jnp.prod(jnp.array([self.norm_coefs[v] ** o for v, o in deriv_order.items()]))
+
+        def deriv_fn_single(model, *args):
+            """Compute derivative for a single sample."""
+            return scale * grad_fn(model, *args)
+
+        # Wrapped function that auto-vectorizes if inputs are arrays
+        def deriv_fn(model, *args):
+            # Convert to array and inspect dims
+            arrs = [jnp.asarray(a) for a in args]
+            # If all scalars, just compute directly
+            if all(jnp.ndim(a) ==0 for a in arrs):
+                return deriv_fn_single(model, *arrs)
+            else:
+                in_axes = (None,) + tuple(None if jnp.ndim(a) == 0 else 0 for a in arrs)
+                return jax.vmap(deriv_fn_single, in_axes = in_axes)(model, *arrs)
+
+        # Attach to instance
+        setattr(self, name_str, deriv_fn)
+
+    def evaluate(self, model, *args, function_names: list):
+        """
+        Compute multiple registered derivatives.
+        Returns a dict mapping name -> array.
         """
         results = {}
         for name in function_names:
             fn = getattr(self, name, None)
-            if fn is None:
-                results[name] = jnp.array([])
-            else:
-                results[name] = fn(model, x, t)
+            results[name] = fn(model, *args) if fn else jnp.array([])
         return results
